@@ -33,10 +33,8 @@ import (
 	"github.com/pingcap/ticdc/pkg/util"
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/clientv3/concurrency"
-	"go.etcd.io/etcd/mvcc"
 	"go.etcd.io/etcd/mvcc/mvccpb"
 	"go.uber.org/zap"
-	"golang.org/x/time/rate"
 )
 
 const (
@@ -370,9 +368,7 @@ type ownerImpl struct {
 	etcdClient  kv.CDCEtcdClient
 	manager     roles.Manager
 
-	captureWatchC      <-chan *CaptureInfoWatchResp
-	cancelWatchCapture func()
-	captures           map[model.CaptureID]*model.CaptureInfo
+	captures map[model.CaptureID]*model.CaptureInfo
 
 	adminJobs     []model.AdminJob
 	adminJobsLock sync.Mutex
@@ -380,35 +376,19 @@ type ownerImpl struct {
 
 // NewOwner creates a new ownerImpl instance
 func NewOwner(pdEndpoints []string, cli kv.CDCEtcdClient, manager roles.Manager) (*ownerImpl, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	infos, watchC, err := newCaptureInfoWatch(ctx, cli)
-	if err != nil {
-		cancel()
-		return nil, errors.Trace(err)
-	}
-
-	captures := make(map[model.CaptureID]*model.CaptureInfo, len(infos))
-	for _, info := range infos {
-		captures[info.ID] = info
-	}
-
 	pdClient, err := pd.NewClient(pdEndpoints, pd.SecurityOption{})
 	if err != nil {
-		cancel()
 		return nil, errors.Trace(err)
 	}
 
 	owner := &ownerImpl{
-		pdEndpoints:        pdEndpoints,
-		pdClient:           pdClient,
-		changeFeeds:        make(map[model.ChangeFeedID]*changeFeed),
-		activeProcessors:   make(map[string]*model.ProcessorInfo),
-		cfRWriter:          cli,
-		etcdClient:         cli,
-		manager:            manager,
-		captureWatchC:      watchC,
-		captures:           captures,
-		cancelWatchCapture: cancel,
+		pdEndpoints:      pdEndpoints,
+		pdClient:         pdClient,
+		changeFeeds:      make(map[model.ChangeFeedID]*changeFeed),
+		activeProcessors: make(map[string]*model.ProcessorInfo),
+		cfRWriter:        cli,
+		etcdClient:       cli,
+		manager:          manager,
 	}
 
 	return owner, nil
@@ -503,36 +483,6 @@ func (o *ownerImpl) removeCapture(info *model.CaptureInfo) {
 		}
 
 	}
-}
-
-func (o *ownerImpl) resetCaptureInfoWatcher(ctx context.Context) error {
-	infos, watchC, err := newCaptureInfoWatch(ctx, o.etcdClient)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	for _, info := range infos {
-		// use addCapture is ok, old info will be covered
-		o.addCapture(info)
-	}
-	o.captureWatchC = watchC
-	return nil
-}
-
-func (o *ownerImpl) handleWatchCapture() error {
-	for resp := range o.captureWatchC {
-		if resp.Err != nil {
-			return errors.Trace(resp.Err)
-		}
-
-		if resp.IsDelete {
-			o.removeCapture(resp.Info)
-		} else {
-			o.addCapture(resp.Info)
-		}
-	}
-
-	log.Info("handleWatchCapture quit")
-	return nil
 }
 
 func (o *ownerImpl) newChangeFeed(
@@ -996,40 +946,12 @@ func (o *ownerImpl) handleAdminJob(ctx context.Context) error {
 
 // TODO avoid this tick style, this means we get `tickTime` latency here.
 func (o *ownerImpl) Run(ctx context.Context, tickTime time.Duration) error {
-	defer o.cancelWatchCapture()
-	handleWatchCaptureC := make(chan error, 1)
-	rl := rate.NewLimiter(0.1, 5)
-	go func() {
-		var err error
-		for {
-			if !rl.Allow() {
-				err = errors.New("capture info watcher exceeds rate limit")
-				break
-			}
-			err = o.handleWatchCapture()
-			if errors.Cause(err) != mvcc.ErrCompacted {
-				break
-			}
-			log.Warn("capture info watcher retryable error", zap.Error(err))
-			time.Sleep(captureInfoWatchRetryDelay)
-			err = o.resetCaptureInfoWatcher(ctx)
-			if err != nil {
-				break
-			}
-		}
-		if err != nil {
-			handleWatchCaptureC <- err
-		}
-	}()
-
 	// ownerChanged
 	ownerChanged := true
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-handleWatchCaptureC:
-			return errors.Annotate(err, "handleWatchCapture failed")
 		case <-time.After(tickTime):
 			if !o.IsOwner(ctx) {
 				ownerChanged = true
